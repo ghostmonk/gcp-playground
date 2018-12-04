@@ -7,25 +7,45 @@ const Datastore = require('@google-cloud/datastore');
 const {Storage} = require('@google-cloud/storage');
 const vision = require('@google-cloud/vision');
 
-
 const datastore = Datastore();
 const storage = new Storage();
 const client = new vision.ImageAnnotatorClient();
 const tmpPath = os.tmpdir();
 
 exports.saveTags = (event) => {
-  return getKey(event.data).then(key => {
-    return processLabels(getStoragePath(event.data), key).then(() => {
+  const data = event.data
+  return getKey(data).then(key => {
+    if (path.parse(data.name).dir !== 'uploads') {
+      console.log('Only processing images from the upload folder');
+      return Promise.resolve();
+    }
+
+    const labels = processLabels(getStoragePath(data), key);
+    const thumbnail = generateThumbnail(data);
+
+    return Promise.all([thumbnail, labels]).then(results => {
+      console.log(results);
+      const entity = results[1];
+
+      const thumbnailName = results[0][0].name;
+      const thumbnailPath = `gs://${data.bucket}/${thumbnailName}`;
+      entity.data.thumbnailPath = thumbnailPath;
+      return datastore.save(entity);
+    });
+
     console.log('Successfully inserted labels');
   })
   .catch(err => {
     console.error('Vision API failed', err);
-    });
   });
 }
 
 exports.deleteTagger = (event) => {
   return getKey(event.data).then(key => {
+    if (!key) {
+      return Promise.resolve();
+    }
+
     return datastore.delete(key).then(() => {
       console.log('Successfully deleted entity.', key);
     })
@@ -46,7 +66,7 @@ function getKey(bucketObject) {
 
   return query.run().then(data => {
     const objectExists = data[0].length > 0;
-    const key = objectExists ? data[0][0][datastore.KEY] : datastore.key('Images');
+    const key = objectExists ? data[0][0][datastore.KEY] : null;
     return key;
   })
   .catch(err => {
@@ -86,7 +106,52 @@ function generateThumbnail(bucketObject) {
   const tempLocalDir = path.join(tmpPath, parsedPath.dir);
   const tempLocalFile = path.join(tmpLocalDir, fileName);
 
-  return mkDirAsync(tempLocalDir);
+  return mkDirAsync(tempLocalDir)
+    .then(() => {
+      return file.download({ destination: tempLocalFile});
+    })
+    .catch(err => {
+      console.error('Failed to download file.', file);
+      return Promise.reject(err);
+    })
+    .then(() => {
+      console.log(`${file.name} successfully downloaded to ${tempLocalFile}`);
+
+      return new Promise((resolve, reject) => {
+        const escapedFile = tempLocalFile.replace(/(\s+)/g, '\\$1');
+        //ImageMagick is available on the vision api
+        exec(`convert ${escapedFile} -thumbnail '200x200' ${escapedFile}`, (err, stdout) => {
+          if (err) {
+            console.error('Failed to resize image', err);
+            reject();
+          } else {
+            resolve(stdout);
+          }
+        });
+      })
+    })
+    .then(() => {
+      console.log(`Image ${fileName} successfully resized to 200x200`);
+      const thumbnailFileName = path.join('thumbnails', fileName);
+
+      return bucket.upload(tempLocalFile, {destination: thumbnailFileName})
+        .catch(err => {
+          console.error('Failed to upload resized image', err);
+          return Promise.reject(err);
+        });
+    })
+    .then((newFileObject) => {
+      return new Promise((resolve, reject) => {
+        console.log('Unlinking file');
+        fs.unlink(tempLocalFile, err => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(newFileObject);
+          }
+        });
+      });
+    });
 }
 
 function mkDirAsync(dir) {
